@@ -1,129 +1,140 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta charset="utf-8" />
   <title>VidQuery</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0d1a22;
+      --surface: #142833;
+      --border: #234455;
+      --text: #e3eef3;
+      --muted: #93aebc;
+      --accent: #45c8df;
+      --good: #4ade80;
+      --bad: #f87171;
+    }
+
+    * { box-sizing: border-box; }
 
     body {
-      width: 280px;
-      background: #0f172a;
-      color: #e2e8f0;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      font-size: 14px;
-    }
-
-    .header {
+      width: 290px;
+      margin: 0;
       padding: 16px;
-      background: #0d1424;
-      border-bottom: 1px solid #1e293b;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.55 "Roboto", -apple-system, "Segoe UI", sans-serif;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
     }
-    .logo {
-      font-size: 18px;
+
+    h1 {
+      margin: 0;
+      font-size: 16px;
       font-weight: 700;
-      color: #38bdf8;
-    }
-    .tagline {
-      font-size: 11px;
-      color: #64748b;
-      margin-top: 2px;
+      letter-spacing: -0.01em;
+      color: var(--accent);
     }
 
-    .body { padding: 16px; }
-
-    .status-row {
+    .row {
       display: flex;
       align-items: center;
       gap: 8px;
-      margin-bottom: 14px;
+      font-size: 12.5px;
+      color: var(--muted);
     }
+
     .dot {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: #22c55e;
-      flex-shrink: 0;
+      background: var(--muted);
+      flex: none;
     }
-    .dot.offline { background: #ef4444; }
-    .status-text { font-size: 12px; color: #94a3b8; }
+    .dot.ok { background: var(--good); }
+    .dot.bad { background: var(--bad); }
 
-    .toggle-btn {
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .kv {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+    }
+    .kv span:first-child { color: var(--muted); }
+    .kv span:last-child {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 11.5px;
+      text-align: right;
+      overflow-wrap: anywhere;
+    }
+
+    button {
       width: 100%;
-      padding: 10px;
-      background: #38bdf8;
-      color: #0f172a;
+      padding: 9px;
+      background: var(--accent);
+      color: #06202a;
       border: none;
       border-radius: 8px;
+      font: 600 13px "Roboto", sans-serif;
       cursor: pointer;
-      font-size: 14px;
-      font-weight: 600;
-      margin-bottom: 10px;
-      transition: background 0.15s;
     }
-    .toggle-btn:hover { background: #7dd3fc; }
+    button:hover { background: #6fd8ea; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-    .info-box {
-      background: #1e293b;
-      border-radius: 8px;
-      padding: 12px;
-      font-size: 12px;
-      color: #94a3b8;
-      line-height: 1.6;
+    .hint {
+      font-size: 11.5px;
+      color: var(--muted);
+      margin: 0;
     }
-    .info-box b { color: #e2e8f0; }
-
-    .footer {
-      padding: 10px 16px;
-      border-top: 1px solid #1e293b;
+    code {
+      font-family: ui-monospace, Consolas, monospace;
       font-size: 11px;
-      color: #334155;
-      text-align: center;
+      background: #0a141a;
+      padding: 1px 4px;
+      border-radius: 3px;
     }
-
-    #not-youtube {
-      text-align: center;
-      padding: 20px;
-      color: #64748b;
-      font-size: 13px;
-    }
-    #not-youtube span { font-size: 28px; display: block; margin-bottom: 8px; }
   </style>
 </head>
 <body>
-  <div class="header">
-    <div class="logo">⚡ VidQuery</div>
-    <div class="tagline">AI-powered YouTube Q&A</div>
+  <h1>VidQuery</h1>
+
+  <div class="row">
+    <span class="dot" id="server-dot"></span>
+    <span id="server-status">Checking server&hellip;</span>
   </div>
 
-  <div id="main-content">
-    <div class="body">
-      <div class="status-row">
-        <div class="dot" id="server-dot"></div>
-        <div class="status-text" id="server-status">Checking server...</div>
-      </div>
-
-      <button class="toggle-btn" id="toggle-btn">
-        Show / Hide Sidebar
-      </button>
-
-      <div class="info-box">
-        <b>How to use:</b><br>
-        1. Open any YouTube video<br>
-        2. The sidebar auto-opens<br>
-        3. Wait for indexing (~5 sec)<br>
-        4. Ask any question about it!
-      </div>
-    </div>
+  <div class="card" id="server-card" hidden>
+    <div class="kv"><span>Model</span><span id="v-model">&mdash;</span></div>
+    <div class="kv"><span>Embeddings</span><span id="v-embed">&mdash;</span></div>
+    <div class="kv"><span>Speech</span><span id="v-asr">&mdash;</span></div>
+    <div class="kv"><span>Visual OCR</span><span id="v-visual">&mdash;</span></div>
   </div>
 
-  <div id="not-youtube" style="display:none">
-    <span>🎬</span>
-    Navigate to a YouTube video<br>to use VidQuery
+  <div id="on-youtube" hidden>
+    <button id="toggle-btn" type="button">Show / hide panel</button>
   </div>
 
-  <div class="footer">VidQuery v1.0 — Final Year Project</div>
+  <p class="hint" id="off-youtube" hidden>
+    Open a YouTube video to use VidQuery.
+  </p>
+
+  <p class="hint" id="server-hint" hidden>
+    Start the backend:<br />
+    <code>cd backend</code><br />
+    <code>.venv\Scripts\uvicorn main:app --port 8000</code>
+  </p>
 
   <script src="popup.js"></script>
 </body>

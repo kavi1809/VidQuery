@@ -1,192 +1,324 @@
 """
 main.py
-VidQuery FastAPI backend — all API endpoints.
- 
-Run with:
-    uvicorn main:app --reload --port 8000
+VidQuery API.
+
+    GET  /health
+    POST /detect      which pipeline this video needs, without processing it
+    POST /process     enqueue ingest, returns a job id immediately
+    GET  /status/{id} stage and progress for a running job
+    POST /ask         hybrid retrieval, grounded answer, faithfulness check
+    POST /summarize   whole-video summary
+    POST /feedback    timestamp chip click, feeding the retrieval boost
+
+Run:  uvicorn main:app --reload --port 8000
 """
- 
+
+import logging
+import re
+from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urlparse
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
-import traceback
- 
-from transcript import extract_video_id, fetch_transcript, chunk_transcript, get_full_text
-from embedder  import embed_and_store, collection_exists
-from retriever import hybrid_search, format_context, extract_timestamps
-from llm       import generate_answer, generate_summary
- 
- 
-# ── App setup ──────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="VidQuery API",
-    description="AI-powered YouTube video Q&A backend",
-    version="1.0.0"
+
+import config
+import embedder
+import faithfulness
+import gemini
+import ingest
+import jobs
+import retriever
+import schemas
+import store
+from pipelines import ExtractionError
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
 )
- 
-# ── Private Network Access middleware ──────────────────────────────────────
-# Fixes Chrome's block on loopback (127.0.0.1) from public origins like youtube.com
-class PrivateNetworkMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method == "OPTIONS":
-            response = JSONResponse(content={}, status_code=200)
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "*"
-            response.headers["Access-Control-Allow-Private-Network"] = "true"
-            return response
-        response = await call_next(request)
-        response.headers["Access-Control-Allow-Private-Network"] = "true"
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        return response
- 
-app.add_middleware(PrivateNetworkMiddleware)
- 
-# Standard CORS
+log = logging.getLogger("vidquery")
+
+# The Windows console is cp1252 by default, which cannot encode the em dashes
+# and arrows in these messages — they arrive as replacement characters, and a
+# stray Unicode name in a video title raises UnicodeEncodeError mid-log.
+for _handler in logging.getLogger().handlers:
+    stream = getattr(_handler, "stream", None)
+    if hasattr(stream, "reconfigure"):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    store.init_db()
+    log.info("VidQuery ready — model=%s, embeddings=%s",
+             config.GEMINI_MODEL, embedder.embedding_backend())
+    if not config.GEMINI_API_KEY:
+        log.warning("GEMINI_API_KEY is not set — /ask and /summarize will fail")
+    yield
+    jobs.registry.shutdown()
+
+
+app = FastAPI(title="VidQuery API", version="2.0.0", lifespan=lifespan)
+
+
+# ── CORS ───────────────────────────────────────────────────────────────────
+# Named origins, not "*". A wildcard origin combined with credentials is
+# rejected outright by browsers, and the extension calls from a real origin.
+#
+# allow_private_network is what lets a page on https://www.youtube.com reach
+# http://127.0.0.1. Chrome sends an extra Access-Control-Request-Private-
+# Network header on the preflight for public → loopback requests, and
+# Starlette rejects the preflight outright unless this is set.
+#
+# Note that this is CORSMiddleware's job, not something to bolt on in a
+# separate middleware: an outer middleware that answers OPTIONS itself never
+# reaches CORSMiddleware, so the preflight comes back with the private-network
+# header but no Access-Control-Allow-Origin. The browser then rejects it and
+# the fetch surfaces as a bare network error — while /health keeps answering
+# fine from the extension popup, which runs on a chrome-extension:// origin
+# and is exempt from CORS entirely.
+#
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=config.ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    allow_private_network=True,
 )
- 
-# In-memory chunk cache
-_chunks_cache: dict = {}
- 
- 
-# ── Request / Response models ──────────────────────────────────────────────
-class ProcessRequest(BaseModel):
-    video_url: str
- 
-class ProcessResponse(BaseModel):
-    video_id:    str
-    chunk_count: int
-    message:     str
- 
-class AskRequest(BaseModel):
-    video_id:     str
-    question:     str
-    chat_history: Optional[List[dict]] = []
- 
-class AskResponse(BaseModel):
-    answer:     str
-    timestamps: List[dict]
-    sources:    List[str]
- 
-class SummarizeRequest(BaseModel):
-    video_id: str
- 
-class SummarizeResponse(BaseModel):
-    summary: str
- 
- 
-# ── Endpoints ──────────────────────────────────────────────────────────────
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def extract_video_id(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("No video supplied")
+
+    if _ID_RE.match(value):
+        return value
+
+    parsed = urlparse(value if "//" in value else f"https://{value}")
+    host = (parsed.hostname or "").replace("www.", "")
+
+    if host == "youtu.be":
+        candidate = parsed.path.lstrip("/").split("/")[0]
+    elif host.endswith("youtube.com"):
+        if parsed.path.startswith(("/embed/", "/v/", "/shorts/")):
+            candidate = parsed.path.split("/")[2]
+        else:
+            candidate = (parse_qs(parsed.query).get("v") or [""])[0]
+    else:
+        candidate = value
+
+    if not _ID_RE.match(candidate):
+        raise ValueError(f"Could not read a video id from {value!r}")
+    return candidate
+
+
+def require_indexed(video_id: str) -> dict:
+    record = store.get_video(video_id)
+    if not record or not store.has_chunks(video_id):
+        raise HTTPException(
+            status_code=409,
+            detail="This video has not been indexed yet. Call /process first.",
+        )
+    return record
+
+
+@app.exception_handler(ExtractionError)
+async def extraction_error_handler(request: Request, exc: ExtractionError):
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+# ── Health ─────────────────────────────────────────────────────────────────
 @app.get("/health")
-def health_check():
-    return {"status": "ok", "service": "VidQuery API"}
- 
- 
-@app.post("/process", response_model=ProcessResponse)
-def process_video(req: ProcessRequest):
+def health():
+    from pipelines import asr, visual
+
+    asr_ok, asr_reason = asr.available()
+    visual_ok, visual_reason = visual.available()
+
+    return {
+        "status": "ok",
+        "gemini": gemini.health(),
+        "embeddings": embedder.embedding_backend(),
+        "pipelines": {
+            "captions": {"available": True},
+            "asr": {"available": asr_ok, "reason": asr_reason or None},
+            "visual": {"available": visual_ok, "reason": visual_reason or None},
+        },
+        "feedback_enabled": config.FEEDBACK_ENABLED,
+    }
+
+
+# ── Detect ─────────────────────────────────────────────────────────────────
+@app.post("/detect", response_model=schemas.DetectResponse)
+def detect_video(req: schemas.DetectRequest):
+    import detector
+
     try:
-        video_id = extract_video_id(req.video_url)
- 
-        if video_id in _chunks_cache:
-            chunks = _chunks_cache[video_id]
-            return ProcessResponse(
-                video_id=video_id,
-                chunk_count=len(chunks),
-                message=f"Already processed. {len(chunks)} chunks ready."
-            )
- 
-        print(f"Fetching transcript for {video_id}...")
-        raw_transcript = fetch_transcript(video_id)
-        chunks = chunk_transcript(raw_transcript, chunk_size=5, overlap=1)
-        _chunks_cache[video_id] = chunks
-        stored = embed_and_store(video_id, chunks)
- 
-        return ProcessResponse(
+        video_id = extract_video_id(req.video)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    record = store.get_video(video_id)
+    if record and store.has_chunks(video_id):
+        return schemas.DetectResponse(
             video_id=video_id,
-            chunk_count=len(chunks),
-            message=f"Video processed. {stored} chunks embedded and ready."
+            pipeline=record["pipeline"],
+            language=record["language"],
+            reason=f"Already indexed — {record['chunk_count']} chunks",
+            indexed=True,
         )
- 
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
- 
- 
-@app.post("/ask", response_model=AskResponse)
-def ask_question(req: AskRequest):
+
+    decision = detector.detect(video_id)
+    return schemas.DetectResponse(
+        video_id=video_id,
+        pipeline=decision["pipeline"],
+        language=decision.get("language"),
+        reason=decision["reason"],
+        indexed=False,
+    )
+
+
+# ── Process ────────────────────────────────────────────────────────────────
+@app.post("/process", response_model=schemas.ProcessResponse)
+def process_video(req: schemas.ProcessRequest):
     try:
-        video_id = req.video_id
-        question = req.question.strip()
- 
-        if not question:
-            raise HTTPException(status_code=400, detail="Question cannot be empty.")
- 
-        if video_id not in _chunks_cache:
-            raise HTTPException(
-                status_code=400,
-                detail="Video not processed yet. Call /process first."
-            )
- 
-        chunks = _chunks_cache[video_id]
- 
-        results = hybrid_search(
+        video_id = extract_video_id(req.video)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not req.force and store.has_chunks(video_id) and embedder.count_for_video(video_id):
+        record = store.get_video(video_id) or {}
+        return schemas.ProcessResponse(
+            job_id="cached",
             video_id=video_id,
-            query=question,
-            chunks=chunks,
-            top_k=8,
-            final_k=4
+            state=jobs.DONE,
+            stage=f"Ready — {record.get('chunk_count', 0)} chunks indexed",
+            progress=1.0,
+            cached=True,
         )
- 
-        if not results:
-            return AskResponse(
-                answer="I couldn't find relevant information in this video for your question.",
-                timestamps=[],
-                sources=[]
-            )
- 
-        context    = format_context(results)
-        answer     = generate_answer(question=question, context=context, chat_history=req.chat_history)
-        timestamps = extract_timestamps(results)
-        sources    = [r["chunk_id"] for r in results]
- 
-        return AskResponse(answer=answer, timestamps=timestamps, sources=sources)
- 
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to answer: {str(e)}")
- 
- 
-@app.post("/summarize", response_model=SummarizeResponse)
-def summarize_video(req: SummarizeRequest):
+
+    def work(job: jobs.Job, report):
+        result = ingest.process_video(video_id, report, force=req.force)
+        job.pipeline = result["pipeline"]
+        job.language = result.get("language")
+        job.chunk_count = result["chunk_count"]
+
+    job = jobs.registry.submit(video_id, work)
+    return schemas.ProcessResponse(
+        job_id=job.job_id,
+        video_id=video_id,
+        state=job.state,
+        stage=job.stage,
+        progress=job.progress,
+    )
+
+
+@app.get("/status/{job_id}", response_model=schemas.StatusResponse)
+def job_status(job_id: str):
+    job = jobs.registry.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown job id")
+    return schemas.StatusResponse(**job.as_dict())
+
+
+# ── Ask ────────────────────────────────────────────────────────────────────
+@app.post("/ask", response_model=schemas.AskResponse)
+def ask(req: schemas.AskRequest):
+    question = req.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    record = require_indexed(req.video_id)
+    transcript_language = record.get("language") or "unknown"
+
+    # BM25 needs terms that can literally match the transcript, so the question
+    # is translated into its language. The vector side keeps the question as
+    # asked — the multilingual encoder handles that direction itself.
+    keyword_query = question
+    if transcript_language not in ("unknown", "en") and config.GEMINI_API_KEY:
+        keyword_query = gemini.translate_question(question, transcript_language)
+
+    results = retriever.hybrid_search(
+        req.video_id, question, keyword_query=keyword_query
+    )
+
+    if not results:
+        return schemas.AskResponse(
+            answer="I couldn't find that in this video.",
+            timestamps=[],
+            sources=[],
+            confidence=schemas.Confidence(
+                confidence="high", threshold=config.FAITHFULNESS_THRESHOLD,
+                ungrounded=[], method="no-retrieval", flagged=False,
+            ),
+            retrieval={"matched": 0},
+        )
+
     try:
-        video_id = req.video_id
- 
-        if video_id not in _chunks_cache:
-            raise HTTPException(
-                status_code=400,
-                detail="Video not processed yet. Call /process first."
-            )
- 
-        chunks    = _chunks_cache[video_id]
-        full_text = " ".join(chunk["text"] for chunk in chunks)
-        summary   = generate_summary(full_text)
- 
-        return SummarizeResponse(summary=summary)
- 
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Summarization failed: {str(e)}")
+        answer = gemini.answer_question(
+            question, results,
+            chat_history=[t.model_dump() for t in req.chat_history],
+        )
+    except gemini.GeminiUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except gemini.GeminiBusy as exc:
+        # Retries are already exhausted inside gemini._generate.
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        log.exception("Generation failed")
+        raise HTTPException(status_code=502, detail=f"Gemini call failed: {exc}")
+
+    verdict = faithfulness.check(answer, results)
+
+    return schemas.AskResponse(
+        answer=answer,
+        timestamps=[schemas.TimestampChip(**t) for t in retriever.timestamps_for(results)],
+        sources=[r["chunk_id"] for r in results],
+        confidence=schemas.Confidence(**verdict),
+        retrieval={
+            "matched": len(results),
+            "keyword_query": keyword_query if keyword_query != question else None,
+            "matched_by": {r["chunk_id"]: r.get("matched_by", []) for r in results},
+        },
+    )
+
+
+# ── Summarize ──────────────────────────────────────────────────────────────
+@app.post("/summarize", response_model=schemas.SummarizeResponse)
+def summarize(req: schemas.SummarizeRequest):
+    require_indexed(req.video_id)
+    chunks = store.get_chunks(req.video_id)
+    full_text = " ".join(c["text"] for c in chunks)
+
+    try:
+        return schemas.SummarizeResponse(summary=gemini.summarize(full_text))
+    except gemini.GeminiUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except gemini.GeminiBusy as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        log.exception("Summarisation failed")
+        raise HTTPException(status_code=502, detail=f"Gemini call failed: {exc}")
+
+
+# ── Feedback ───────────────────────────────────────────────────────────────
+@app.post("/feedback", response_model=schemas.FeedbackResponse)
+def feedback(req: schemas.FeedbackRequest):
+    """
+    A timestamp chip click is an implicit positive signal. The boost it earns
+    is capped at config.FEEDBACK_MAX_BOOST and applied after fusion — see
+    retriever.reciprocal_rank_fusion for why the cap has to be small.
+    """
+    store.log_feedback(req.video_id, req.chunk_id, req.clicked, req.question)
+    return schemas.FeedbackResponse(recorded=True)

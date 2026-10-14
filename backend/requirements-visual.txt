@@ -1,0 +1,21 @@
+# Visual pipeline for slide-only videos.
+#
+# INSTALL THIS IN A SEPARATE VENV. PaddlePaddle pins numpy and protobuf
+# versions that conflict with chromadb, and on Windows it is the single
+# most fragile dependency in the project. Keeping it isolated means a
+# failed OCR install cannot take the core API down.
+#
+#   py -m venv .venv-visual
+#   .venv-visual\Scripts\activate
+#   pip install -r requirements-visual.txt
+
+opencv-python-headless>=4.10
+imagehash>=4.3
+pillow>=10.0
+yt-dlp>=2025.1.1
+python-Levenshtein>=0.25
+
+# Pick at least one. EasyOCR alone is a reasonable start on Windows.
+easyocr>=1.7
+# paddleocr>=2.9
+# paddlepaddle>=2.6

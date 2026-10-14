@@ -1,0 +1,36 @@
+{
+  "_readme": [
+    "One entry per question. relevant_chunks are the chunk ids that",
+    "genuinely answer it \u2014 read eval/chunks/<video_id>.txt to find them.",
+    "answer_time_s is where the answer is actually discussed, used for",
+    "Timestamp Accuracy. reference_answer is your own wording of the",
+    "correct answer, used for ROUGE-L.",
+    "Aim for 80-120 questions. Thirty cannot separate 0.71 from 0.57."
+  ],
+  "videos": [
+    {
+      "video_id": "46P1rL0rzPE",
+      "pipeline": "captions",
+      "language": "en",
+      "chunks": 187
+    },
+    {
+      "video_id": "aircAruvnKk",
+      "pipeline": "captions",
+      "language": "ar",
+      "chunks": 32
+    }
+  ],
+  "questions": [
+    {
+      "id": "q1",
+      "video_id": "46P1rL0rzPE",
+      "question": "What does she say about failure?",
+      "relevant_chunks": [
+        "chunk_0"
+      ],
+      "answer_time_s": 12.0,
+      "reference_answer": "She got out for zero in the 2017 World Cup final."
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+# Speech recognition for videos with audio but no captions.
+#   pip install -r requirements-asr.txt
+# Also needs ffmpeg on PATH:  winget install Gyan.FFmpeg
+
+faster-whisper>=1.1
+yt-dlp>=2025.1.1
